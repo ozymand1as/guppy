@@ -576,7 +576,7 @@ def main():
     parser.add_argument("--engine", default=None, help="Path to laguna binary")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--cap", type=int, default=64, help="Expert cache size (default: 64)")
+    parser.add_argument("--cap", type=int, default=128, help="Expert cache size (default: 128)")
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--ram-gb", type=int, default=20, help="RAM budget in GB (default: 20)")
     parser.add_argument("--ctx", type=int, default=1024, help="Max context length (default: 1024)")
