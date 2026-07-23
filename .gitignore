@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Model files (large)
+laguna_model/
+laguna_i4/
+*.safetensors
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+
+# OS files
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
