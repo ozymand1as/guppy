@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """OpenAI-compatible API server for the Laguna S 2.1 model.
 
-Uses the laguna engine's serve mode for persistent model loading and KV cache reuse.
 Provides OpenAI-compatible endpoints with streaming support:
   - GET  /v1/models
   - GET  /health
@@ -11,7 +10,7 @@ Provides OpenAI-compatible endpoints with streaming support:
   - POST /v1/completions (with streaming)
 
 Usage:
-  python3 laguna_openai_server.py --model ~/Documents/Personal_projects/laguna_i4 --port 8000 [--warm-cache]
+  python3 laguna_openai_server.py --model ~/Documents/Personal_projects/laguna_i4 --port 8000 [--warm-cache] [--metal]
 """
 import argparse
 import json
@@ -25,8 +24,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 class LagunaEngine:
-    """Manages a persistent laguna engine subprocess in serve mode."""
-    def __init__(self, model_dir, engine_path, cap=8, max_tokens=1024, ram_gb=20, warm_cache=False):
+    """Manages laguna engine subprocess calls."""
+    def __init__(self, model_dir, engine_path, cap=64, max_tokens=1024, ram_gb=20, warm_cache=False, use_metal=False, ctx=1024, kv_i8=True, persistent=False):
         self.model_dir = model_dir
         self.engine_path = engine_path
         self.cap = cap
@@ -35,6 +34,10 @@ class LagunaEngine:
         self.lock = threading.Lock()
         self.tokenizer = None
         self.warm_cache = warm_cache
+        self.use_metal = use_metal
+        self.ctx = ctx
+        self.kv_i8 = kv_i8
+        self.persistent = persistent
         self.process = None
         self._load_tokenizer()
         
@@ -43,7 +46,8 @@ class LagunaEngine:
             sys.stderr.flush()
             self._warm_file_cache()
         
-        self._start_engine()
+        if persistent:
+            self._start_engine()
     
     def _load_tokenizer(self):
         from tokenizers import Tokenizer
@@ -74,6 +78,11 @@ class LagunaEngine:
         env["TEMP"] = "0.7"
         env["NUCLEUS"] = "0.9"
         env["TOPK"] = "20"
+        env["CTX"] = str(self.ctx)
+        if self.use_metal:
+            env["COLI_METAL"] = "1"
+        if self.kv_i8:
+            env["KV_I8"] = "1"
         
         self.process = subprocess.Popen(
             [self.engine_path, str(self.cap), "4"],
@@ -97,6 +106,31 @@ class LagunaEngine:
         sys.stderr.write("[engine] Ready and waiting for requests\n")
         sys.stderr.flush()
     
+    def _send_reset(self):
+        """Send RESET command to clear conversation."""
+        self.process.stdin.write(b"\x02RESET\n")
+        self.process.stdin.flush()
+        self._read_until_end()
+    
+    def _read_until_end(self):
+        """Read output until END marker, consuming the STAT line too."""
+        output = b""
+        end_marker = b"\x01\x01END\x01\x01"
+        while True:
+            byte = self.process.stdout.read(1)
+            if not byte:
+                break
+            output += byte
+            if end_marker in output:
+                idx = output.index(end_marker)
+                # Consume the newline after END marker
+                self.process.stdout.read(1)  # consume \n
+                # Read STAT line
+                stat = self.process.stdout.readline()
+                return output[:idx].decode("utf-8", errors="replace"), stat
+        stat = self.process.stdout.readline()
+        return output.decode("utf-8", errors="replace"), stat
+    
     def _send_prompt(self, prompt, max_tokens, temperature, top_p):
         """Send a PROMPT command and read the response."""
         payload = prompt.encode("utf-8")
@@ -109,27 +143,13 @@ class LagunaEngine:
         self.process.stdin.flush()
         
         # Read output until END marker
-        output = b""
-        end_marker = b"\x01\x01END\x01\x01"
-        while True:
-            byte = self.process.stdout.read(1)
-            if not byte:
-                break
-            output += byte
-            if end_marker in output:
-                idx = output.index(end_marker)
-                # Consume the END marker and trailing newline
-                remaining = output[idx + len(end_marker):]
-                # Read STAT line
-                stat = self.process.stdout.readline()
-                text = output[:idx]
-                # Decode and parse stats
-                stat_str = stat.decode("utf-8", errors="replace").strip()
-                stats = self._parse_stat(stat_str)
-                return text.decode("utf-8", errors="replace"), stats
+        text, stat = self._read_until_end()
         
-        stat = self.process.stdout.readline()
-        return output.decode("utf-8", errors="replace"), self._parse_stat(stat.decode("utf-8", errors="replace").strip())
+        # Parse stats
+        stat_str = stat.decode("utf-8", errors="replace").strip() if isinstance(stat, bytes) else stat.strip()
+        stats = self._parse_stat(stat_str)
+        
+        return text.strip(), stats
     
     def _parse_stat(self, stat_line):
         """Parse STAT line: STAT <prod> <tok/s> <hit%> <rss_gb> <prompt_tokens> <length_limited> <decode_tps>"""
@@ -146,60 +166,119 @@ class LagunaEngine:
             }
         return {}
     
-    def _reset(self):
-        """Reset the conversation."""
-        self.process.stdin.write(b"\x02RESET\n")
-        self.process.stdin.flush()
-        # Read END and STAT
-        self._read_until_end()
-    
-    def _read_until_end(self):
-        """Read output until END marker."""
-        output = b""
-        end_marker = b"\x01\x01END\x01\x01"
-        while True:
-            byte = self.process.stdout.read(1)
-            if not byte:
-                break
-            output += byte
-            if end_marker in output:
-                idx = output.index(end_marker)
-                # Consume remaining bytes after END marker (should be just \n)
-                remaining = output[idx + len(end_marker):]
-                # Read STAT line
-                stat = self.process.stdout.readline()
-                return
+    def _run_engine(self, prompt, max_tokens, temperature, top_p):
+        """Run the engine with given parameters and return output."""
+        enc = self.tokenizer.encode(prompt, add_special_tokens=True)
+        token_ids = [2] + enc.ids  # Ensure BOS token
+        ids_str = ",".join(str(t) for t in token_ids)
+        
+        env = os.environ.copy()
+        env["SNAP"] = self.model_dir
+        env["RAM_GB"] = str(self.ram_gb)
+        env["PROMPT"] = "x"
+        env["IDS"] = ids_str
+        env["NGEN"] = str(min(max_tokens, self.max_tokens))
+        env["TEMP"] = str(temperature)
+        env["NUCLEUS"] = str(top_p)
+        env["TOPK"] = "20"
+        env["CTX"] = str(self.ctx)
+        if self.use_metal:
+            env["COLI_METAL"] = "1"
+        if self.kv_i8:
+            env["KV_I8"] = "1"
+        
+        result = subprocess.run(
+            [self.engine_path, str(self.cap), "4"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        
+        return result.stdout
     
     def generate(self, prompt, max_tokens=128, temperature=0.7, top_p=0.9, top_k=20):
         """Generate text from a prompt (non-streaming)."""
         with self.lock:
-            # Reset conversation for each request (no KV cache sharing between users)
-            self._reset()
-            
             start_time = time.time()
-            text, stats = self._send_prompt(prompt, max_tokens, temperature, top_p)
-            elapsed = time.time() - start_time
             
-            sys.stderr.write(f"[generate] {stats.get('tokens', 0)} tokens in {elapsed:.1f}s ({stats.get('tok_per_sec', 0):.2f} tok/s) | hit rate: {stats.get('hit_rate', 0):.1f}%\n")
-            sys.stderr.flush()
-            
-            return text.strip()
+            if self.persistent:
+                # Use serve mode for KV cache persistence
+                text, stats = self._send_prompt(prompt, max_tokens, temperature, top_p)
+                elapsed = time.time() - start_time
+                
+                sys.stderr.write(f"[generate] {stats.get('tokens', 0)} tokens in {elapsed:.1f}s ({stats.get('tok_per_sec', 0):.2f} tok/s) | hit rate: {stats.get('hit_rate', 0):.1f}%\n")
+                sys.stderr.flush()
+                return text
+            else:
+                # Use IDS mode (new process per request)
+                output = self._run_engine(prompt, max_tokens, temperature, top_p)
+                elapsed = time.time() - start_time
+                
+                # Parse output
+                token_match = re.search(r'tokens:\s+(.+)', output)
+                if token_match:
+                    token_ids_str = token_match.group(1).strip()
+                    generated_ids = [int(x) for x in token_ids_str.split()]
+                    decoded = self.tokenizer.decode(generated_ids)
+                    
+                    # Extract stats
+                    speed_match = re.search(r'([\d.]+) tok/s', output)
+                    speed = float(speed_match.group(1)) if speed_match else 0
+                    hit_match = re.search(r'expert hit rate: ([\d.]+)%', output)
+                    hit_rate = float(hit_match.group(1)) if hit_match else 0
+                    
+                    sys.stderr.write(f"[generate] {len(generated_ids)} tokens in {elapsed:.1f}s ({speed:.2f} tok/s) | hit rate: {hit_rate:.1f}%\n")
+                    sys.stderr.flush()
+                    
+                    return decoded
+                
+                sys.stderr.write(f"[generate] Error: {output}\n")
+                sys.stderr.flush()
+                return output.strip()
     
     def generate_stream(self, prompt, max_tokens=128, temperature=0.7, top_p=0.9, top_k=20):
         """Generate text from a prompt (streaming). Yields text chunks."""
         with self.lock:
-            # Reset conversation for each request
-            self._reset()
-            
             start_time = time.time()
-            text, stats = self._send_prompt(prompt, max_tokens, temperature, top_p)
-            elapsed = time.time() - start_time
             
-            sys.stderr.write(f"[stream] {stats.get('tokens', 0)} tokens in {elapsed:.1f}s ({stats.get('tok_per_sec', 0):.2f} tok/s) | hit rate: {stats.get('hit_rate', 0):.1f}%\n")
-            sys.stderr.flush()
-            
-            # Yield the entire output as one chunk (engine doesn't support token-by-token streaming in serve mode)
-            yield text.strip()
+            if self.persistent:
+                # Use serve mode for KV cache persistence
+                text, stats = self._send_prompt(prompt, max_tokens, temperature, top_p)
+                elapsed = time.time() - start_time
+                
+                sys.stderr.write(f"[stream] {stats.get('tokens', 0)} tokens in {elapsed:.1f}s ({stats.get('tok_per_sec', 0):.2f} tok/s) | hit rate: {stats.get('hit_rate', 0):.1f}%\n")
+                sys.stderr.flush()
+                
+                yield text
+            else:
+                # Use IDS mode (new process per request)
+                output = self._run_engine(prompt, max_tokens, temperature, top_p)
+                elapsed = time.time() - start_time
+                
+                # Parse output
+                token_match = re.search(r'tokens:\s+(.+)', output)
+                if token_match:
+                    token_ids_str = token_match.group(1).strip()
+                    generated_ids = [int(x) for x in token_ids_str.split()]
+                    
+                    # Extract stats
+                    speed_match = re.search(r'([\d.]+) tok/s', output)
+                    speed = float(speed_match.group(1)) if speed_match else 0
+                    hit_match = re.search(r'expert hit rate: ([\d.]+)%', output)
+                    hit_rate = float(hit_match.group(1)) if hit_match else 0
+                    
+                    sys.stderr.write(f"[stream] {len(generated_ids)} tokens in {elapsed:.1f}s ({speed:.2f} tok/s) | hit rate: {hit_rate:.1f}%\n")
+                    sys.stderr.flush()
+                    
+                    # Decode each token individually for streaming
+                    for tid in generated_ids:
+                        token_text = self.tokenizer.decode([tid])
+                        yield token_text
+                else:
+                    sys.stderr.write(f"[stream] Error: {output}\n")
+                    sys.stderr.flush()
+                    yield output.strip()
     
     def get_health(self):
         """Get engine health information."""
@@ -211,7 +290,7 @@ class LagunaEngine:
             "kv_slots": 1,
             "tiers": {"vram": 0, "ram": self.ram_gb, "disk": 56, "vram_gb": 0, "ram_gb": self.ram_gb},
             "hwinfo": {"cores": os.cpu_count() or 8, "ram_total_gb": 25, "ram_avail_gb": 15,
-                      "gpus": 0, "vram_total_gb": 0, "cpu": "Apple Silicon", "gpu": ""}
+                      "gpus": 1 if self.use_metal else 0, "vram_total_gb": 0, "cpu": "Apple Silicon", "gpu": "Apple GPU" if self.use_metal else ""}
         }
     
     def close(self):
@@ -303,8 +382,6 @@ class APIHandler(BaseHTTPRequestHandler):
         temperature = body.get("temperature", 0.7)
         top_p = body.get("top_p", 0.9)
         stream = body.get("stream", False)
-        enable_thinking = body.get("enable_thinking", False)
-        cache_slot = body.get("cache_slot", None)
         
         # Build prompt from messages
         prompt_parts = []
@@ -321,7 +398,7 @@ class APIHandler(BaseHTTPRequestHandler):
         request_id = f"chatcmpl-{int(time.time())}"
         
         if stream:
-            self.handle_streaming_response(request_id, "chat.completion.chunk", prompt, max_tokens, temperature, top_p, is_chat=True, enable_thinking=enable_thinking)
+            self.handle_streaming_response(request_id, "chat.completion.chunk", prompt, max_tokens, temperature, top_p, is_chat=True)
         else:
             try:
                 output = engine.generate(prompt, max_tokens, temperature, top_p)
@@ -499,11 +576,18 @@ def main():
     parser.add_argument("--engine", default=None, help="Path to laguna binary")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--cap", type=int, default=8, help="Expert cache size")
+    parser.add_argument("--cap", type=int, default=64, help="Expert cache size (default: 64)")
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--ram-gb", type=int, default=20)
+    parser.add_argument("--ram-gb", type=int, default=20, help="RAM budget in GB (default: 20)")
+    parser.add_argument("--ctx", type=int, default=1024, help="Max context length (default: 1024)")
     parser.add_argument("--warm-cache", action="store_true", 
                         help="Pre-load model files into OS file cache for faster startup")
+    parser.add_argument("--metal", action="store_true",
+                        help="Enable Metal GPU acceleration")
+    parser.add_argument("--kv-i8", action="store_true", default=True,
+                        help="Use int8 KV cache compression (4x memory savings, default: on)")
+    parser.add_argument("--persistent", action="store_true",
+                        help="Keep engine process alive between requests (enables KV cache reuse)")
     args = parser.parse_args()
     
     if args.engine is None:
@@ -512,10 +596,14 @@ def main():
     print(f"Starting Laguna S 2.1 API server...", file=sys.stderr)
     print(f"Model: {args.model}", file=sys.stderr)
     print(f"Engine: {args.engine}", file=sys.stderr)
+    if args.metal:
+        print(f"Metal backend: enabled", file=sys.stderr)
     if args.warm_cache:
         print(f"Warm cache mode: enabled (pre-loading model files)", file=sys.stderr)
+    if args.persistent:
+        print(f"Persistent mode: enabled (KV cache preserved between requests)", file=sys.stderr)
     
-    engine = LagunaEngine(args.model, args.engine, args.cap, args.max_tokens, args.ram_gb, args.warm_cache)
+    engine = LagunaEngine(args.model, args.engine, args.cap, args.max_tokens, args.ram_gb, args.warm_cache, args.metal, args.ctx, args.kv_i8, args.persistent)
     server = LagunaAPIServer((args.host, args.port), engine)
     
     print(f"API listening on http://{args.host}:{args.port}/v1", file=sys.stderr)

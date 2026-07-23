@@ -32,6 +32,16 @@
 #include "tok.h"
 #include "tier.h"
 #ifdef COLI_CUDA
+#include "backend_cuda.h"
+#endif
+#ifdef COLI_METAL
+#include "backend_metal.h"
+#endif
+#ifndef COLI_ACCEL_TAG
+#define COLI_ACCEL_TAG "[GPU]"
+#endif
+#include <omp.h>
+#ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
 #endif
@@ -249,6 +259,11 @@ static float *falloc(int64_t n){
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p;
 }
 
+#ifdef COLI_METAL
+static int g_metal_enabled;
+static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
+#endif
+
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
@@ -444,6 +459,12 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
         w->cuda_failed=1;
         fprintf(stderr,COLI_ACCEL_TAG " tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
+    }
+#endif
+#ifdef COLI_METAL
+    if(g_metal_enabled && S>=g_metal_gemm_min && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
+        const void *weights = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+        if(coli_metal_gemm(y,x,weights,w->s,w->fmt,S,w->I,w->O)) return;
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
@@ -2524,6 +2545,15 @@ static void run_serve(Model *m, const char *snap){
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8);
+            // Prepend BOS token (id=2) if not already present
+            if(prompt_tokens>0 && tmp[0]!=2){
+                // Shift tokens to make room for BOS
+                if(prompt_tokens < maxctx-8){
+                    memmove(tmp+1, tmp, prompt_tokens*sizeof(int));
+                    tmp[0] = 2;  // BOS token
+                    prompt_tokens++;
+                }
+            }
             int old_len=len, prefix=0;
             while(prefix<old_len&&prefix<prompt_tokens&&hist[prefix]==tmp[prefix]) prefix++;
             if(prefix<old_len) len=prefix;
@@ -2644,6 +2674,14 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
+#ifdef COLI_METAL
+    g_metal_enabled=getenv("COLI_METAL")?atoi(getenv("COLI_METAL")):0;
+    if(g_metal_enabled){
+        g_metal_enabled=coli_metal_init();
+        if(!g_metal_enabled){ fprintf(stderr,COLI_ACCEL_TAG " requested but unavailable\n"); }
+        else fprintf(stderr,COLI_ACCEL_TAG " mode: GPU GEMM acceleration enabled\n");
+    }
+#endif
     printf("== Hy3 C engine, cache=%d experts/layer | experts@%d-bit dense@%d-bit ==\n",cap,ebits,dbits);
     g_mem_avail_boot=mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
@@ -2735,6 +2773,9 @@ int main(int argc, char **argv){
     if(m.gpu_expert_count) printf("CUDA expert tier: %d resident experts (%.2f GB) | %llu calls served from VRAM\n",
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
+#endif
+#ifdef COLI_METAL
+    if(g_metal_enabled) coli_metal_shutdown();
 #endif
     if(stats) stats_dump(&m,stats);
     usage_save(&m);
